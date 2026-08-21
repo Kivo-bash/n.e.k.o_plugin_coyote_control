@@ -3,5 +3,6 @@ __pycache__/
 .DS_Store
 data/
 config.json
-vendor/
 sync_to_neko.sh
+.pytest_cache/
+store.db
