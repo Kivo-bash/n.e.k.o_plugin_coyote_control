@@ -9,7 +9,9 @@ if vendor_path.exists():
     sys.path.insert(0, str(vendor_path))
 
 import asyncio
+import inspect
 import random
+import re
 import threading
 import time
 import uuid
@@ -35,6 +37,25 @@ from .waveforms import get_waveform_frames
 from .web_server import CoyoteWebServer
 
 
+# 文本动作标记（兜底通道）：角色卡要求模型在做设备动作时，
+# 在回复末尾输出固定格式标记，例如（郊狼·轻度惩罚·强度35）。
+# 工具调用是首选路径；有些模型只扮演不调用工具，此标记作为后置识别。
+_TEXT_ACTION_RE = re.compile(
+    r"[（(]\s*郊狼\s*[·・:：\-]?\s*"
+    r"(?P<mode>温柔奖励|活泼奖励|轻度调戏|轻度惩罚|强力惩罚|归零|停止)"
+    r"(?:\s*[·・:：\-]?\s*强度\s*(?P<intensity>\d{1,3}))?"
+    r"\s*[）)]"
+)
+
+_TEXT_MODE_MAP = {
+    "温柔奖励": "reward_gentle",
+    "活泼奖励": "reward_playful",
+    "轻度调戏": "tease_light",
+    "轻度惩罚": "punish_mild",
+    "强力惩罚": "punish_strong",
+}
+
+
 @neko_plugin
 class CoyoteControlPlugin(NekoPluginBase):
     """郊狼控制插件"""
@@ -55,6 +76,11 @@ class CoyoteControlPlugin(NekoPluginBase):
         self._web_thread: Optional[threading.Thread] = None
         self._state_lock = threading.Lock()
         self._llm_tool_guard_task: Optional[asyncio.Task] = None
+        self._text_watcher_task: Optional[asyncio.Task] = None
+        # 最近一次由 LLM 真实发起的工具调用时间；文本标记兜底会避让，
+        # 防止"工具已执行 + 标记又触发"造成同一动作重复下发
+        self._last_llm_tool_ts = 0.0
+        self._text_fallback_active = False
 
         self.server_host = "0.0.0.0"
         self.server_port = 9998
@@ -116,6 +142,10 @@ class CoyoteControlPlugin(NekoPluginBase):
             # 重启后注册会丢失且 SDK 不自动补注册（见 tool-calling 文档），
             # 这里定期探测并自动重新注册。
             self._llm_tool_guard_task = asyncio.create_task(self._llm_tool_guard())
+
+            # 文本动作标记兜底：轮询对话总线，识别猫娘回复里的固定格式
+            # 动作标记（郊狼·模式·强度N），模型没调用工具时也能驱动设备
+            self._text_watcher_task = asyncio.create_task(self._text_action_watcher())
 
             self.logger.info("CoyoteControlPlugin startup complete")
             return Ok({
@@ -195,6 +225,104 @@ class CoyoteControlPlugin(NekoPluginBase):
                 self.logger.debug("LLM tool guard probe failed: %s", error)
             await asyncio.sleep(30)
 
+    async def _text_action_watcher(self):
+        """后置兜底：扫描猫娘回复文本中的固定动作标记并驱动设备。
+
+        工具调用是前置首选，但部分模型会只在台词里扮演而不真正调用
+        工具。角色卡已规定：做设备动作时必须输出固定格式标记
+        （郊狼·模式·强度N）。这里轮询 conversations 总线，发现新的
+        assistant 回复中带标记且近期没有真实工具调用时，代为执行。
+        """
+        seen: Dict[str, None] = {}  # 用 dict 保序，便于裁剪最旧记录
+        baseline_done = False
+
+        await asyncio.sleep(10)
+        while True:
+            try:
+                result = self.bus.conversations.get(max_count=10, timeout=5.0)
+                if inspect.isawaitable(result):
+                    result = await result
+                records = list(result or [])
+
+                for rec in records:
+                    content = getattr(rec, "content", None) or ""
+                    ts = getattr(rec, "timestamp", None) or 0
+                    conv_id = getattr(rec, "conversation_id", "") or ""
+                    key = f"{conv_id}:{ts}:{hash(content)}"
+                    if key in seen:
+                        continue
+                    seen[key] = None
+
+                    # 首轮只建立基线，不回放历史消息里的标记
+                    if not baseline_done:
+                        continue
+
+                    # 只处理 AI 回复；turn_type 缺失时放行（宁可多查一次正则）
+                    turn = (getattr(rec, "turn_type", None) or "").lower()
+                    if turn and turn not in ("assistant", "ai"):
+                        continue
+
+                    matches = list(_TEXT_ACTION_RE.finditer(content))
+                    if not matches:
+                        continue
+
+                    if time.time() - self._last_llm_tool_ts < 20:
+                        self.logger.info(
+                            "Text action marker found but a real tool call "
+                            "just happened, skipping fallback"
+                        )
+                        continue
+
+                    for match in matches[:3]:
+                        await self._execute_text_action(match)
+
+                baseline_done = True
+                # 防止 seen 无限增长
+                while len(seen) > 500:
+                    seen.pop(next(iter(seen)))
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                self.logger.debug("Text action watcher poll failed: %s", error)
+            await asyncio.sleep(2)
+
+    async def _execute_text_action(self, match: "re.Match"):
+        """执行文本标记对应的设备动作（复用 LLM 工具的实现）"""
+        mode_word = match.group("mode")
+        intensity_str = match.group("intensity")
+        intensity = int(intensity_str) if intensity_str else None
+        self.logger.info(
+            "Text action marker detected: mode=%s intensity=%s",
+            mode_word, intensity,
+        )
+
+        # 标记为兜底调用，避免更新 _last_llm_tool_ts 把后续标记误判成
+        # "刚有真实工具调用"而被跳过
+        self._text_fallback_active = True
+        try:
+            if mode_word in ("归零", "停止"):
+                result = await self.set_coyote_intensity(
+                    channel="both",
+                    intensity=0,
+                    reason=f"文本标记兜底：{mode_word}",
+                )
+            else:
+                # control_coyote 会设置临时强度并下发对应模式波形；
+                # custom_intensity=None 时使用模式默认强度
+                result = await self.control_coyote(
+                    mode=_TEXT_MODE_MAP[mode_word],
+                    reason=f"文本标记兜底：{mode_word}",
+                    custom_intensity=intensity,
+                )
+            if isinstance(result, dict) and not result.get("success"):
+                self.logger.warning(
+                    "Text action fallback failed: %s", result.get("error")
+                )
+        except Exception as error:
+            self.logger.error("Text action fallback error: %s", error)
+        finally:
+            self._text_fallback_active = False
+
     @lifecycle(id="shutdown")
     async def shutdown(self, **_):
         """关闭插件"""
@@ -202,6 +330,9 @@ class CoyoteControlPlugin(NekoPluginBase):
             if self._llm_tool_guard_task:
                 self._llm_tool_guard_task.cancel()
                 self._llm_tool_guard_task = None
+            if self._text_watcher_task:
+                self._text_watcher_task.cancel()
+                self._text_watcher_task = None
             if self.web_server and self._web_loop:
                 try:
                     if hasattr(self.web_server, 'stop') and callable(self.web_server.stop):
@@ -416,6 +547,9 @@ class CoyoteControlPlugin(NekoPluginBase):
             "【重要】只要你在回复中描写、宣称或暗示对郊狼设备执行了任何操作"
             "（电击/奖励/惩罚/调戏等），就必须实际调用本工具或 set_coyote_intensity，"
             "严禁只在台词或括号动作里扮演而不调用工具——那样设备不会有任何反应。"
+            "同时无论是否调用了工具，都要在回复末尾输出固定动作标记"
+            "（郊狼·模式·强度N），模式限：温柔奖励/活泼奖励/轻度调戏/"
+            "轻度惩罚/强力惩罚/归零。"
         ),
         parameters={
             "type": "object",
@@ -450,6 +584,8 @@ class CoyoteControlPlugin(NekoPluginBase):
         custom_duration_ms: Optional[int] = None,
     ):
         """LLM Tool: 控制郊狼设备"""
+        if not self._text_fallback_active:
+            self._last_llm_tool_ts = time.time()
         if not self._is_app_connected():
             return {"success": False, "error": "设备未连接"}
 
@@ -522,6 +658,9 @@ class CoyoteControlPlugin(NekoPluginBase):
             "【重要】只要你在回复中描写、宣称或暗示调整了设备强度"
             "（拉满/加到XX/归零等），就必须实际调用本工具执行，"
             "严禁只在台词或括号动作里扮演而不调用工具——那样设备不会有任何反应。"
+            "同时无论是否调用了工具，都要在回复末尾输出固定动作标记"
+            "（郊狼·模式·强度N），模式限：温柔奖励/活泼奖励/轻度调戏/"
+            "轻度惩罚/强力惩罚/归零。"
         ),
         parameters={
             "type": "object",
@@ -556,6 +695,8 @@ class CoyoteControlPlugin(NekoPluginBase):
         duration_ms: Optional[int] = None,
     ):
         """LLM Tool: 直接设置设备强度"""
+        if not self._text_fallback_active:
+            self._last_llm_tool_ts = time.time()
         if not self._is_app_connected():
             return {"success": False, "error": "设备未连接"}
 
