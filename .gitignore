@@ -4,3 +4,4 @@ __pycache__/
 data/
 config.json
 vendor/
+sync_to_neko.sh
