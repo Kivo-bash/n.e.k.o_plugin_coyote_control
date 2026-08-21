@@ -77,7 +77,11 @@ class CoyoteControlPlugin(NekoPluginBase):
 
     def _load_or_create_controller_id(self) -> str:
         """持久化控制方 controller_id：重启不变化，APP 无需重扫配对"""
-        state_file = Path(__file__).parent / "data" / "controller_id.txt"
+        try:
+            # 规范要求用 self.data_path() 而非硬编码插件目录
+            state_file = Path(self.data_path("controller_id.txt"))
+        except Exception:
+            state_file = Path(__file__).parent / "data" / "controller_id.txt"
         try:
             state_file.parent.mkdir(parents=True, exist_ok=True)
             if state_file.exists():
@@ -106,8 +110,7 @@ class CoyoteControlPlugin(NekoPluginBase):
             if self.web_enabled:
                 self._start_web_server()
 
-            if not self.store.enabled:
-                self.store.enabled = True
+            # 存储改由 plugin.toml 的 [plugin.store] enabled=true 声明启用
 
             # 守护 LLM 工具注册：main_server 的工具注册表是内存态，
             # 重启后注册会丢失且 SDK 不自动补注册（见 tool-calling 文档），

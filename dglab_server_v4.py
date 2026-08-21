@@ -260,9 +260,11 @@ class DglabServerV4:
     async def _handle_message(self, sender_id: str, message: Dict):
         """处理收到的消息（V4 应用层：t=req / resp / ev）"""
         msg_type = message.get("type")
-        self.logger.info(
-            "Recv from %s: type=%s", sender_id, msg_type
-        )
+        # ping/pong 每 2s 一次，降为 debug 防止刷屏；业务消息保持 info
+        if msg_type in ("ping", "pong", "heartbeat"):
+            self.logger.debug("Recv from %s: type=%s", sender_id, msg_type)
+        else:
+            self.logger.info("Recv from %s: type=%s", sender_id, msg_type)
 
         if msg_type == "ping":
             # 应用层 ping 探测：必须回 pong，否则 APP 等待 8s(responseTimeout) 后断开
